@@ -1,0 +1,301 @@
+/**
+ * ============================================================================
+ * Configuration Constants
+ * ============================================================================
+ */
+
+// Google Sheet ID where rows will be appended
+// Replace or verify your Google Sheet ID here:
+const SHEET_ID = 'PASTE_YOUR_SHEET_ID_HERE';
+
+// Keyword to search for within email subjects
+const KEYWORD = 'qwert';
+
+// Gmail label applied to processed threads to avoid duplicate processing
+const LABEL_NAME = 'bates-logged';
+
+// Regular expression to match Bates numbers
+// Example format: ABC-000123 (2 to 6 uppercase letters, a hyphen, and 5 to 8 digits)
+// Modify this regex if your Bates number convention differs.
+const BATES_REGEX = /\b[A-Z]{2,6}-\d{5,8}\b/i;
+
+// Optional: Name of the sheet tab. Leave empty ('') to use the first/active sheet.
+const SHEET_TAB_NAME = '';
+
+
+/**
+ * ============================================================================
+ * Main Agent Function: processBatesEmails
+ * ============================================================================
+ * Searches Gmail for emails matching KEYWORD without the LABEL_NAME label,
+ * extracts Bates numbers from subject, attachments, or body, logs them to
+ * Google Sheets, and labels the threads as processed.
+ */
+function processBatesEmails() {
+  // 1. Ensure the tracking label exists in Gmail (creates it if it doesn't exist)
+  const label = getOrCreateLabel(LABEL_NAME);
+
+  // 2. Build the search query: subject contains KEYWORD and lacks LABEL_NAME
+  const query = `subject:"${KEYWORD}" -label:${LABEL_NAME}`;
+  Logger.log(`Searching Gmail with query: ${query}`);
+  
+  // Fetch up to 50 matching threads to avoid execution timeout
+  const threads = GmailApp.search(query, 0, 50);
+  if (threads.length === 0) {
+    Logger.log('No unprocessed emails found.');
+    return;
+  }
+  Logger.log(`Found ${threads.length} thread(s) to process.`);
+
+  // 3. Open the target Google Sheet and prepare header if sheet is new/empty
+  const sheet = getTargetSheet();
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(['Date', 'Subject', 'Attachment File Name', 'Bates Number']);
+    sheet.getRange(1, 1, 1, 4).setFontWeight('bold');
+  }
+
+  // 4. Iterate through each thread and each message
+  for (let t = 0; t < threads.length; t++) {
+    const thread = threads[t];
+    const messages = thread.getMessages();
+
+    for (let m = 0; m < messages.length; m++) {
+      const message = messages[m];
+
+      const emailDate = message.getDate();
+      const subject = message.getSubject() || '';
+      const attachments = message.getAttachments();
+      const plainBody = message.getPlainBody() || '';
+
+      // Collect attachment filenames
+      let attachmentNamesString = 'not found';
+      const attachmentNamesList = [];
+      if (attachments && attachments.length > 0) {
+        for (let a = 0; a < attachments.length; a++) {
+          attachmentNamesList.push(attachments[a].getName());
+        }
+        attachmentNamesString = attachmentNamesList.join(', ');
+      }
+
+      // Search for Bates number in:
+      // 1. Subject
+      // 2. Attachment file names
+      // 3. Email body
+      const batesNumber = findBatesNumber(subject, attachmentNamesList, plainBody);
+
+      // Append row: Date, Subject, Attachment File Name, Bates Number
+      sheet.appendRow([
+        emailDate,
+        subject,
+        attachmentNamesString,
+        batesNumber
+      ]);
+
+      Logger.log(`Logged message: "${subject}" | Bates: "${batesNumber}" | Attachments: "${attachmentNamesString}"`);
+    }
+
+    // 5. Apply the label to the entire thread so it is never re-processed
+    thread.addLabel(label);
+  }
+
+  Logger.log('Processing complete.');
+}
+
+
+/**
+ * ============================================================================
+ * Test Function: testRun
+ * ============================================================================
+ * Processes ONLY the first matching thread and prints detailed log output.
+ * Logs what it finds (subject, attachments, body, and Bates match), appends
+ * the row to your Google Sheet, and adds the label.
+ *
+ * Run this function from the Apps Script editor to verify behavior before
+ * enabling the recurring trigger.
+ */
+function testRun() {
+  Logger.log('================ [ testRun() Started ] ================');
+  
+  // 1. Ensure the tracking label exists
+  const label = getOrCreateLabel(LABEL_NAME);
+
+  // 2. Query for 1 thread only
+  const query = `subject:"${KEYWORD}" -label:${LABEL_NAME}`;
+  Logger.log(`Searching Gmail with query: ${query}`);
+
+  const threads = GmailApp.search(query, 0, 1);
+  if (threads.length === 0) {
+    Logger.log('⚠️ No matching emails found.');
+    Logger.log(`Tip: Send an email with "${KEYWORD}" in the subject to your Gmail, and ensure it does not already have the "${LABEL_NAME}" label.`);
+    Logger.log('================ [ testRun() Finished ] ================');
+    return;
+  }
+
+  Logger.log('Found 1 matching thread. Inspecting messages...');
+
+  // 3. Open target Google Sheet & add header if empty
+  const sheet = getTargetSheet();
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(['Date', 'Subject', 'Attachment File Name', 'Bates Number']);
+    sheet.getRange(1, 1, 1, 4).setFontWeight('bold');
+    Logger.log('Added header row to empty Google Sheet.');
+  }
+
+  const thread = threads[0];
+  const messages = thread.getMessages();
+  Logger.log(`Thread contains ${messages.length} message(s).`);
+
+  // 4. Process each message in this single thread
+  for (let m = 0; m < messages.length; m++) {
+    const message = messages[m];
+    const emailDate = message.getDate();
+    const subject = message.getSubject() || '';
+    const attachments = message.getAttachments();
+    const plainBody = message.getPlainBody() || '';
+
+    // Collect attachment filenames
+    let attachmentNamesString = 'not found';
+    const attachmentNamesList = [];
+    if (attachments && attachments.length > 0) {
+      for (let a = 0; a < attachments.length; a++) {
+        attachmentNamesList.push(attachments[a].getName());
+      }
+      attachmentNamesString = attachmentNamesList.join(', ');
+    }
+
+    // Extract Bates number
+    const batesNumber = findBatesNumber(subject, attachmentNamesList, plainBody);
+
+    // Detailed diagnostic log
+    Logger.log(`\n--- Message ${m + 1} of ${messages.length} ---`);
+    Logger.log(`• Date: ${emailDate}`);
+    Logger.log(`• Subject: "${subject}"`);
+    Logger.log(`• Attachment(s): ${attachmentNamesString}`);
+    Logger.log(`• Bates Number Detected: "${batesNumber}"`);
+    Logger.log(`• Body snippet (first 120 chars): "${plainBody.substring(0, 120).replace(/\n/g, ' ')}..."`);
+
+    // Append row to sheet
+    sheet.appendRow([
+      emailDate,
+      subject,
+      attachmentNamesString,
+      batesNumber
+    ]);
+    Logger.log(`✓ Row successfully appended to Google Sheet "${sheet.getName()}".`);
+  }
+
+  // 5. Apply the label to mark thread as processed
+  thread.addLabel(label);
+  Logger.log(`✓ Applied label "${LABEL_NAME}" to thread.`);
+  Logger.log('================ [ testRun() Completed Successfully ] ================');
+  Logger.log('Please check your Google Sheet to confirm the row was recorded correctly.');
+}
+
+
+/**
+ * ============================================================================
+ * Helper Function: findBatesNumber
+ * ============================================================================
+ * Scans subject, attachment names, and email body for a Bates number.
+ * Returns the matched Bates number, or "not found" if no match is found.
+ *
+ * @param {string} subject - The email subject line.
+ * @param {Array<string>} attachmentNames - List of attachment file names.
+ * @param {string} body - Plain text email body.
+ * @return {string} The found Bates number or "not found".
+ */
+function findBatesNumber(subject, attachmentNames, body) {
+  // 1. Check subject
+  const subjectMatch = subject.match(BATES_REGEX);
+  if (subjectMatch) {
+    return subjectMatch[0];
+  }
+
+  // 2. Check attachment file names
+  if (attachmentNames && attachmentNames.length > 0) {
+    for (let i = 0; i < attachmentNames.length; i++) {
+      const nameMatch = attachmentNames[i].match(BATES_REGEX);
+      if (nameMatch) {
+        return nameMatch[0];
+      }
+    }
+  }
+
+  // 3. Check email body
+  const bodyMatch = body.match(BATES_REGEX);
+  if (bodyMatch) {
+    return bodyMatch[0];
+  }
+
+  return 'not found';
+}
+
+
+/**
+ * ============================================================================
+ * Helper Function: getOrCreateLabel
+ * ============================================================================
+ * Retrieves the Gmail label by name, or creates it if it doesn't already exist.
+ *
+ * @param {string} labelName - Name of the Gmail label.
+ * @return {GmailLabel} The Gmail label object.
+ */
+function getOrCreateLabel(labelName) {
+  let label = GmailApp.getUserLabelByName(labelName);
+  if (!label) {
+    Logger.log(`Label "${labelName}" not found. Creating it...`);
+    label = GmailApp.createLabel(labelName);
+  }
+  return label;
+}
+
+
+/**
+ * ============================================================================
+ * Helper Function: getTargetSheet
+ * ============================================================================
+ * Opens the target Google Sheet by SHEET_ID and selects the appropriate tab.
+ *
+ * @return {Sheet} The Google Sheet instance.
+ */
+function getTargetSheet() {
+  const spreadsheet = SpreadsheetApp.openById(SHEET_ID);
+  if (SHEET_TAB_NAME && SHEET_TAB_NAME.trim() !== '') {
+    const sheet = spreadsheet.getSheetByName(SHEET_TAB_NAME);
+    if (!sheet) {
+      throw new Error(`Sheet tab named "${SHEET_TAB_NAME}" was not found in spreadsheet ${SHEET_ID}.`);
+    }
+    return sheet;
+  }
+  // Default to the first sheet tab
+  return spreadsheet.getSheets()[0];
+}
+
+
+/**
+ * ============================================================================
+ * Automation Function: createTrigger
+ * ============================================================================
+ * Sets up a time-driven trigger that runs processBatesEmails() every 15 minutes.
+ * Deletes any existing triggers for processBatesEmails to avoid duplicate runs.
+ */
+function createTrigger() {
+  const handlerFunction = 'processBatesEmails';
+
+  // Remove any pre-existing triggers for this function to prevent duplicate schedules
+  const existingTriggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < existingTriggers.length; i++) {
+    if (existingTriggers[i].getHandlerFunction() === handlerFunction) {
+      ScriptApp.deleteTrigger(existingTriggers[i]);
+      Logger.log(`Removed existing trigger for ${handlerFunction}.`);
+    }
+  }
+
+  // Create a new time-driven trigger running every 15 minutes
+  ScriptApp.newTrigger(handlerFunction)
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+
+  Logger.log(`Trigger created: "${handlerFunction}" will run every 15 minutes.`);
+}
